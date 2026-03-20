@@ -39,24 +39,43 @@ fn emit_progress(app: &AppHandle, stage: &str, percent: f32, msg: &str) {
 /// Called by the Tauri command `export_sequence`.
 pub fn export_sequence(
     app: AppHandle,
-    timeline: Timeline,
+    mut timeline: Timeline,
     settings: ExportSettings,
 ) -> Result<String> {
     if timeline.clips.is_empty() {
         anyhow::bail!("Timeline is empty — nothing to export.");
     }
 
+    // 1. Auto-trim end point for seamless looping if requested.
+    if settings.auto_trim_loop {
+        emit_progress(&app, "diagnostic", 0.0, "AI Diagnostic: Finding best loop point…");
+        // We analyse the last clip relative to the first clip's start frame.
+        // For simplicity, we assume a single clip is being looped, or the last clip 
+        // should loop back to the first.
+        let last_idx = timeline.clips.len() - 1;
+        let last_clip = &timeline.clips[last_idx];
+        
+        // Use a 2-second search window at the end of the last clip's source.
+        match crate::looping::find_loop_point(&last_clip.source_path, 2.0) {
+            Ok(best_ts) => {
+                info!("AI Diagnostic suggested loop point: {best_ts:.3}s (original end: {:.3}s)", last_clip.end_time);
+                timeline.clips[last_idx].end_time = best_ts;
+            },
+            Err(e) => warn!("Loop diagnostic failed: {e}. Using user-defined end points."),
+        }
+    }
+
     // Working directory for all intermediate files.
     let tmp = TempDir::new().context("Failed to create temp directory")?;
     let tmp_path = tmp.path().to_path_buf();
 
-    emit_progress(&app, "prepare", 0.0, "Analysing clips…");
+    emit_progress(&app, "prepare", 5.0, "Analysing clips…");
 
     let total = timeline.clips.len() as f32;
     let mut segment_files: Vec<PathBuf> = Vec::new();
 
     for (i, clip) in timeline.clips.iter().enumerate() {
-        let pct_base = (i as f32 / total) * 85.0;
+        let pct_base = 5.0 + (i as f32 / total) * 80.0;
         emit_progress(
             &app,
             "segment",
@@ -64,7 +83,7 @@ pub fn export_sequence(
             &format!("Processing clip {}/{}", i + 1, timeline.clips.len()),
         );
 
-        let segments = process_clip(clip, &tmp_path, settings.force_smart_cut)
+        let segments = process_clip(clip, &tmp_path, settings.force_smart_cut, settings.optimize_for_looping)
             .with_context(|| format!("Failed to process clip {i}: {}", clip.source_path))?;
 
         segment_files.extend(segments);
@@ -77,6 +96,7 @@ pub fn export_sequence(
         &concat_list,
         &settings.output_path,
         &timeline.clips[0].source_path, // metadata donor
+        settings.optimize_for_looping,
     )?;
 
     emit_progress(&app, "done", 100.0, "Export complete.");
@@ -88,7 +108,7 @@ pub fn export_sequence(
 
 /// Process a single clip and return a list of segment file paths.
 /// Implements smart-cut: re-encode unaligned boundaries, stream-copy the rest.
-fn process_clip(clip: &Clip, tmp: &Path, force_smart_cut: bool) -> Result<Vec<PathBuf>> {
+fn process_clip(clip: &Clip, tmp: &Path, force_smart_cut: bool, loop_opt: bool) -> Result<Vec<PathBuf>> {
     let fps = detect_fps(&clip.source_path).unwrap_or(30.0);
     let start = clip.start_time;
     let end = clip.end_time;
@@ -104,7 +124,7 @@ fn process_clip(clip: &Clip, tmp: &Path, force_smart_cut: bool) -> Result<Vec<Pa
     if start_aligned && end_aligned {
         // ── Fast path: pure stream copy ──────────────────────────────────────
         let out = tmp_file(tmp, "copy_full");
-        stream_copy_segment(&clip.source_path, start, end, &out)?;
+        stream_copy_segment(&clip.source_path, start, end, &out, loop_opt)?;
         Ok(vec![out])
     } else {
         // ── Smart-cut path ──────────────────────────────────────────────────
@@ -117,19 +137,19 @@ fn process_clip(clip: &Clip, tmp: &Path, force_smart_cut: bool) -> Result<Vec<Pa
             if let Some(next_kf) = nearest_following_keyframe(&clip.source_path, start, fps)? {
                 if next_kf < end - 0.01 {
                     let out = tmp_file(tmp, "reenc_head");
-                    reencode_segment(&clip.source_path, start, next_kf, &out)?;
+                    reencode_segment(&clip.source_path, start, next_kf, &out, loop_opt)?;
                     segments.push(out);
                     current_pos = next_kf;
                 } else {
                     // Next keyframe is beyond the end, re-encode the entire clip.
                     let out = tmp_file(tmp, "reenc_all");
-                    reencode_segment(&clip.source_path, start, end, &out)?;
+                    reencode_segment(&clip.source_path, start, end, &out, loop_opt)?;
                     return Ok(vec![out]);
                 }
             } else {
                 // No following keyframe found, re-encode to the end.
                 let out = tmp_file(tmp, "reenc_all");
-                reencode_segment(&clip.source_path, start, end, &out)?;
+                reencode_segment(&clip.source_path, start, end, &out, loop_opt)?;
                 return Ok(vec![out]);
             }
         }
@@ -141,26 +161,26 @@ fn process_clip(clip: &Clip, tmp: &Path, force_smart_cut: bool) -> Result<Vec<Pa
                 if prev_kf > current_pos + 0.01 {
                     // Middle section: stream-copy from current_pos to prev_kf.
                     let copy_out = tmp_file(tmp, "copy_mid");
-                    stream_copy_segment(&clip.source_path, current_pos, prev_kf, &copy_out)?;
+                    stream_copy_segment(&clip.source_path, current_pos, prev_kf, &copy_out, loop_opt)?;
                     segments.push(copy_out);
                     current_pos = prev_kf;
                 }
                 
                 // Tail section: re-encode from current_pos to end.
                 let reenc_tail = tmp_file(tmp, "reenc_tail");
-                reencode_segment(&clip.source_path, current_pos, end, &reenc_tail)?;
+                reencode_segment(&clip.source_path, current_pos, end, &reenc_tail, loop_opt)?;
                 segments.push(reenc_tail);
             } else {
                 // No preceding keyframe for end; re-encode remaining from current_pos.
                 let out = tmp_file(tmp, "reenc_tail");
-                reencode_segment(&clip.source_path, current_pos, end, &out)?;
+                reencode_segment(&clip.source_path, current_pos, end, &out, loop_opt)?;
                 segments.push(out);
             }
         } else {
             // End is aligned, stream-copy the remainder.
             if end > current_pos + 0.01 {
                 let out = tmp_file(tmp, "copy_tail");
-                stream_copy_segment(&clip.source_path, current_pos, end, &out)?;
+                stream_copy_segment(&clip.source_path, current_pos, end, &out, loop_opt)?;
                 segments.push(out);
             }
         }
@@ -171,21 +191,30 @@ fn process_clip(clip: &Clip, tmp: &Path, force_smart_cut: bool) -> Result<Vec<Pa
 
 /// Stream-copy a time range from source into a temp MP4.
 /// -avoid_negative_ts make_zero fixes DTS discontinuities between clips.
-fn stream_copy_segment(source: &str, start: f64, end: f64, out: &Path) -> Result<()> {
+fn stream_copy_segment(source: &str, start: f64, end: f64, out: &Path, loop_opt: bool) -> Result<()> {
+    let mut args = vec![
+        "-y",
+        "-ss", &format!("{start:.6}"),
+        "-to", &format!("{end:.6}"),
+        "-i", source,
+        "-c", "copy",
+        "-map", "0",
+    ];
+
+    if loop_opt {
+        args.extend(["-fps_mode", "passthrough", "-avoid_negative_ts", "make_zero", "-copytb", "1"]);
+    } else {
+        args.extend(["-vsync", "0"]);
+    }
+
+    args.extend([
+        "-ignore_unknown",
+        "-movflags", "+faststart",
+        out.to_str().unwrap(),
+    ]);
+
     let status = make_cmd(&ffmpeg_bin())
-        .args([
-            "-y",
-            "-ss", &format!("{start:.6}"),
-            "-to", &format!("{end:.6}"),
-            "-i", source,
-            "-c", "copy",
-            "-map", "0",
-            "-vsync", "0",
-            "-avoid_negative_ts", "make_zero",
-            "-ignore_unknown",
-            "-movflags", "+faststart",
-            out.to_str().unwrap(),
-        ])
+        .args(&args)
         .status()
         .context("Failed to spawn ffmpeg for stream copy")?;
 
@@ -197,7 +226,7 @@ fn stream_copy_segment(source: &str, start: f64, end: f64, out: &Path) -> Result
 
 /// Re-encode a small segment (only the GOP at the cut boundary).
 /// Prioritises hardware encoders to prevent CPU bottlenecks and keep VRAM busy.
-fn reencode_segment(source: &str, start: f64, end: f64, out: &Path) -> Result<()> {
+fn reencode_segment(source: &str, start: f64, end: f64, out: &Path, loop_opt: bool) -> Result<()> {
     // We use very high quality (CRF 14) + no B-frames to stay frame-accurate.
     // This segment is typically < 2 seconds (one GOP), so speed is not a concern.
 
@@ -244,10 +273,15 @@ fn reencode_segment(source: &str, start: f64, end: f64, out: &Path) -> Result<()
         "-c:v", vcodec,
     ];
     args.extend(extra_args);
+    args.extend(["-c:a", "copy"]);
+
+    if loop_opt {
+        args.extend(["-fps_mode", "passthrough", "-avoid_negative_ts", "make_zero", "-copytb", "1"]);
+    } else {
+        args.extend(["-vsync", "0"]);
+    }
+
     args.extend([
-        "-c:a", "copy",
-        "-vsync", "0",
-        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         out.to_str().unwrap(),
     ]);
@@ -260,22 +294,31 @@ fn reencode_segment(source: &str, start: f64, end: f64, out: &Path) -> Result<()
     // If hardware encoding fails, fallback to libx264
     if !status.success() && vcodec != "libx264" {
         warn!("Hardware encode failed ({vcodec}), falling back to libx264");
+        let mut f_args = vec![
+            "-y",
+            "-ss", &format!("{start:.6}"),
+            "-to", &format!("{end:.6}"),
+            "-i", source,
+            "-c:v", "libx264",
+            "-crf", "14",
+            "-preset", "fast",
+            "-x264-params", "bframes=0:keyint=1",
+            "-c:a", "copy",
+        ];
+
+        if loop_opt {
+            f_args.extend(["-fps_mode", "passthrough", "-avoid_negative_ts", "make_zero", "-copytb", "1"]);
+        } else {
+            f_args.extend(["-vsync", "0"]);
+        }
+
+        f_args.extend([
+            "-movflags", "+faststart",
+            out.to_str().unwrap(),
+        ]);
+
         let fallback_status = make_cmd(&ffmpeg_bin())
-            .args([
-                "-y",
-                "-ss", &format!("{start:.6}"),
-                "-to", &format!("{end:.6}"),
-                "-i", source,
-                "-c:v", "libx264",
-                "-crf", "14",
-                "-preset", "fast",
-                "-x264-params", "bframes=0:keyint=1",
-                "-c:a", "copy",
-                "-vsync", "0",
-                "-avoid_negative_ts", "make_zero",
-                "-movflags", "+faststart",
-                out.to_str().unwrap(),
-            ])
+            .args(&f_args)
             .status()
             .context("Failed to spawn fallback ffmpeg for re-encode")?;
 
@@ -299,26 +342,35 @@ fn concat_segments(
     concat_list: &Path,
     output_path: &str,
     metadata_source: &str,
+    loop_opt: bool,
 ) -> Result<String> {
+    let mut args = vec![
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_list.to_str().unwrap(),
+        // Second input solely for metadata passthrough.
+        "-i", metadata_source,
+        "-c", "copy",
+    ];
+
+    if loop_opt {
+        args.extend(["-fps_mode", "passthrough", "-avoid_negative_ts", "make_zero", "-copytb", "1", "-fflags", "+genpts"]);
+    } else {
+        args.extend(["-vsync", "0"]);
+    }
+
+    args.extend([
+        "-map_metadata", "1",   // pull global metadata from metadata_source
+        "-map", "0",            // video/audio from concat
+        "-ignore_unknown",
+        "-write_tmcd", "0",
+        "-movflags", "+faststart",
+        output_path,
+    ]);
+
     let status = make_cmd(&ffmpeg_bin())
-        .args([
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_list.to_str().unwrap(),
-            // Second input solely for metadata passthrough.
-            "-i", metadata_source,
-            "-c", "copy",
-            "-vsync", "0",
-            "-map_metadata", "1",   // pull global metadata from metadata_source
-            "-map", "0",            // video/audio from concat
-            "-ignore_unknown",
-            "-avoid_negative_ts", "make_zero",
-            "-fflags", "+genpts",
-            "-write_tmcd", "0",
-            "-movflags", "+faststart",
-            output_path,
-        ])
+        .args(&args)
         .status()
         .context("Failed to spawn ffmpeg for final concat")?;
 

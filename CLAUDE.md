@@ -23,4 +23,5 @@ A lossless video editor focusing on stream-copy (pass-through) by default and "s
 - **Smart-Cut Precision:** Fixed `engine.rs` to correctly re-encode only the GOP boundaries at the exact cut points, preventing extra footage "overhang" when start/end points are unaligned.
 - **Hardware-Accelerated Smart-Cut:** Updated `engine.rs` to detect and use GPU encoders (`nvenc`, `vaapi`, `videotoolbox`) based on the platform and source codec (H.264/HEVC).
 - **Timeline QoL:** Added Ctrl/Cmd/Alt + Scroll wheel zoom to `Timeline.svelte`, centering on the mouse cursor.
-- **Export Stability:** Added FFmpeg flags (`-avoid_negative_ts make_zero`, `-fflags +genpts`) to ensure gapless exports and correct timestamps.
+- **Export Stability:** Added togglable FFmpeg flags (`-fps_mode passthrough`, `-copytb 1`, etc.) for seamless gapless looping. Default remains standard `-vsync 0` unless "Looping" is checked.
+- **AI Loop Diagnostic:** Added `looping.rs` and `suggest_loop_point` command to identify the best matching end-frame using MSE. Integrated as an "AI Trim" toggle in the export UI that auto-adjusts clip duration before processing.
